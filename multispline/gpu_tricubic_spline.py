@@ -1,10 +1,15 @@
 from numba import cuda, njit
 import numpy as np
-# import cupy as cp
+import cupy as cp
 
 class AmpInterp3dGPU:
     def __init__(self, coeffs, x0, dx, nx, y0, dy, ny, z0, dz, nz):
-        self.coeffs = coeffs.reshape(coeffs.shape[0], -1)
+        breakpoint()
+        
+        coeff_temp = coeffs.reshape(coeffs.shape[0], -1)
+
+        self.coeffs = cuda.to_device(coeff_temp)
+
         self.x0 = x0
         self.y0 = y0
         self.z0 = z0
@@ -17,20 +22,35 @@ class AmpInterp3dGPU:
         self.ny = ny
         self.nz = nz
 
-        self.ng = coeffs.shape[0]
-        self.grid_shape = coeffs.shape[1]
-    
+        self.ng = self.coeffs.shape[0]
+        self.grid_shape = self.coeffs.shape[1]
+
     def evaluate_3d_spline(self, x, y, z, out=None):
         if out is None:
-            out = cuda.device_array((self.ng, x.size))
+            out = cp.zeros(self.ng * x.size)
 
-        threadsperblock = 256
-        blockspergrid = ((x.size + (threadsperblock - 1)) // threadsperblock, self.grid_shape)
-        return _evaluate_3d_spline_kernel[blockspergrid, threadsperblock, 0, 8*self.grid_shape](
+        x_in = cuda.to_device(x.flatten())
+        y_in = cuda.to_device(y.flatten())
+        z_in = cuda.to_device(z.flatten())
+
+        # organisation:
+            # Each block corresponds to one trajectory point
+            # We may be able to adjust threadsperblock based on the number of requested modes (rounded to mult of 32)? Set to 64 for now.
+            # blockspergrid is set based on the number of trajectory points (x.size)
+
+            # coefficients array should store things so that the special index is f(i,j,k) + mode_num + [0,64]*nmodes
+            # shared array size = threadsperblock * 64 * 8
+
+        threadsperblock = 64
+        blockspergrid = ((x.size + (threadsperblock - 1)) // threadsperblock, self.ng // threadsperblock) # y-axis is mode overflow
+        print("BPG:", blockspergrid)
+                # _evaluate_3d_spline_kernel[blockspergrid, threadsperblock](
+        #_evaluate_3d_spline_kernel[blockspergrid, threadsperblock, 0, int(8*self.grid_shape)](
+        _evaluate_3d_spline_kernel[blockspergrid, threadsperblock, 0, int( 64 * threadsperblock * 8)](
             out,
-            x, 
-            y, 
-            z, 
+            x_in, 
+            y_in, 
+            z_in, 
             self.coeffs,
             self.x0,
             self.dx,
@@ -42,8 +62,10 @@ class AmpInterp3dGPU:
             self.dz,
             self.nz,
             self.ng,
-            self.grid_shape
+            x_in.size,
             )
+
+        return out.reshape(self.ng, *x.shape).get()
 
 @njit
 def get_interval(a, a0, da, na):
@@ -54,28 +76,28 @@ def get_interval(a, a0, da, na):
         return na - 1
     return idx   
 
-@njit
-def _compute_tricubic_spline_value(coeffs_here, x, x0, dx, nx, y, y0, dy, ny, z, z0, dz, nz):
-    result = 0.
+# @njit
+# def get_interval(a, a0, da, na):
+#     return int((a - a0) / da) 
 
-    i = get_interval(x, x0, dx, nx)
-    j = get_interval(y, y0, dy, ny)
-    k = get_interval(z, z0, dz, nz)
-    xbar = (x - x0 - i * dx) / dx
-    ybar = (y - y0 - j * dy) / dy
-    zbar = (z - z0 - k * dz) / dz
+@njit
+def _compute_tricubic_spline_value(coeffs_here, xbar, x0, dx, nx, ybar, y0, dy, ny, zbar, z0, dz, nz):
+    result = 0.
 
     zvec = cuda.local.array(16, dtype=np.float64)
     yvec = cuda.local.array(4, dtype=np.float64)
 
     for l in range(4):
         for m in range(4):
+            zvec[4 * l + m] = 0.
             for n in range(4):
                 zvec[4 * l + m] = (
                     zvec[4 * l + m] * zbar
-                    + coeffs_here[i, j, k, l * 16 + m * 4 + (3 - n)]  # rewrite this to not use a (shared) and to do a 1-d index?
+                    + coeffs_here[l*16 + m*4 + (3 - n)]
+                    # + coeffs_here[i, j, k, l * 16 + m * 4 + (3 - n)]
+                    
                 )
-
+        yvec[l] = 0.
         for n in range(4):
             yvec[l] = yvec[l] * ybar + zvec[4 * l + (3 - n)]
 
@@ -85,71 +107,61 @@ def _compute_tricubic_spline_value(coeffs_here, x, x0, dx, nx, y, y0, dy, ny, z,
     return result
 
 @cuda.jit
-def _evaluate_3d_spline_kernel(outp, x, y, z, coeffs, x0, dx, nx, y0, dy, ny, z0, dz, nz, ng, c_per_g):
+def _evaluate_3d_spline_kernel(outp, x, y, z, coeffs, x0, dx, nx, y0, dy, ny, z0, dz, nz, ng, nvec):
 
-    # NB: we're likely to pass in ~100 points in x,y,z here and evaluate ~ 1E4 amplitudes? 
+    vec_ind = cuda.blockIdx.x
 
-    # For speed, we should assign shared memory.
+    if vec_ind < nvec:  # avoid out-of-bounds indexing
 
-    # Here we want to loop over blocks in the grid
-    # this should use something like 
-    # int start_block = blockIdx.y;
-    # int block_inc = gridDim.y;
+        coeffs_shared = cuda.shared.array(0, dtype=np.float64)
+        
+        mode_ind = cuda.threadIdx.x
+        mode_ind_on_block = mode_ind + cuda.blockDim.y * cuda.blockInd.y # handle the mode blocks on the y axis
 
-    # start: which "spline grid slice of blocks" we are on
-    start_block = cuda.blockIdx.y
-    # inc: length of the spline grid slice of blocks
-    inc_block = cuda.gridDim.y
+        x_here = x[vec_ind]
+        y_here = y[vec_ind]
+        z_here = z[vec_ind]
 
-    for a in range(start_block, ng, inc_block):
-        # if we are using shared memory, it should be filled here
-        # good candidate for shared memory is the coefficients array as it is indexed all over the place by each thread block
-        # by doing this we can avoid needing to pass "a"
-        # instead the coefficients at "a" get loaded into shared memory here and passed to the device function
-        # the coefficients array will have a dynamic size of coeffs.size per grid
-        # check the numba documentation to see how to do this
+        i_here = get_interval(x_here, x0, dx, nx)
+        j_here = get_interval(y_here, x0, dx, nx)
+        k_here = get_interval(z_here, x0, dx, nx)
 
-        # dynamic shared memory, picks up from third argument of kernel invocation
-        coeffs_here = cuda.shared.array(0, dtype=np.float64)
+        xbar = (x_here - x0 - i_here * dx) / dx
+        ybar = (y_here - y0 - j_here * dy) / dy
+        zbar = (z_here - z0 - k_here * dz) / dz
 
-        # to fill it we loop over indices like these
-        # threads should index NEIGHBOURING LOCATIONS IN MEMORY
-        # int start_thread = threadIdx.x;
-        # int thread_inc = blockDim.x;
-        # stop = c_per_g
+        i_here = i_here * nx
+        j_here = j_here * ny
+        k_here = k_here * nz
 
-        #start: which thread we are on
-        start_thread = cuda.threadIdx.x
+        ind_loc = (i_here*nx*ny*nz + j_here*ny*nz + k_here*nz)*64*ng
+        shared_fill_ind = ind_loc + mode_ind_on_block
 
-        # inc: length of each thread block
-        inc_thread = cuda.blockDim.x
+        # sync before loading up
+        cuda.syncthreads()
 
-        for fill_i in range(start_thread, c_per_g, inc_thread):
-            coeffs_here[fill_i] = coeffs[a, fill_i]
+        # now load the coefficients at this (i, j, k) into shared memory
+        # index is at (i,j,k) + mode_ind and loops over 64 elements strided by nmodes
+        for coeff_fill_ind in range(64):
+            coeffs_shared[coeff_fill_ind] = coeffs[shared_fill_ind + ng * coeff_fill_ind]
 
-        # then lastly we want to loop over threads in the block
-        # this should use something like
-        # int full_loop_start = threadIdx.x + blockDim.x * blockIdx.x;
-        # int full_loop_inc = blockDim.x * gridDim.x;
+        # sync again to ensure shared memory fill is complete
+        cuda.syncthreads()
 
-        # start: the thread we are on in this block
-        start_fill_ind = cuda.threadIdx.x + cuda.blockDim.x * cuda.blockIdx.x 
-
-        # inc: the number of threads in the grid in this direction (each thread does one value)
-        inc_fill_ind = cuda.blockDim.x * cuda.gridDim.x
-
-        for i in range(start_fill_ind, x.size, inc_fill_ind):
-            outp[a, i] = _compute_tricubic_spline_value(
-                coeffs_here, 
-                x[i], 
+        # output fill neigbouring parts: vec_ind * nmodes + mode_ind
+        if mode_ind < ng:  # block overflow of threads per block (last block will not be full)
+            fill_ind = vec_ind * ng + mode_ind_on_block
+            outp[fill_ind] = _compute_tricubic_spline_value(
+                coeffs_shared,
+                xbar, 
                 x0, 
                 dx, 
                 nx, 
-                y[i], 
+                ybar, 
                 y0, 
                 dy, 
                 ny, 
-                z[i], 
+                zbar, 
                 z0, 
                 dz, 
                 nz
