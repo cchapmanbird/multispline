@@ -1,14 +1,15 @@
 from numba import cuda, njit
 import numpy as np
-import cupy as cp
+# import cupy as cp
+cp = np
 
 class AmpInterp3dGPU:
     def __init__(self, coeffs, x0, dx, nx, y0, dy, ny, z0, dz, nz):
-        breakpoint()
+        # breakpoint()
         
-        coeff_temp = coeffs.reshape(coeffs.shape[0], -1)
+        # coeff_temp = coeffs.reshape(coeffs.shape[0], -1)
 
-        self.coeffs = cuda.to_device(coeff_temp)
+        self.coeffs = cuda.to_device(np.moveaxis(coeffs, 0, -1).ravel())
 
         self.x0 = x0
         self.y0 = y0
@@ -23,7 +24,7 @@ class AmpInterp3dGPU:
         self.nz = nz
 
         self.ng = self.coeffs.shape[0]
-        self.grid_shape = self.coeffs.shape[1]
+        # self.grid_shape = self.coeffs.shape[1]
 
     def evaluate_3d_spline(self, x, y, z, out=None):
         if out is None:
@@ -65,7 +66,7 @@ class AmpInterp3dGPU:
             x_in.size,
             )
 
-        return out.reshape(self.ng, *x.shape).get()
+        return out.reshape(self.ng, *x.shape)#.get()
 
 @njit
 def get_interval(a, a0, da, na):
@@ -134,7 +135,7 @@ def _evaluate_3d_spline_kernel(outp, x, y, z, coeffs, x0, dx, nx, y0, dy, ny, z0
         j_here = j_here * ny
         k_here = k_here * nz
 
-        ind_loc = (i_here*nx*ny*nz + j_here*ny*nz + k_here*nz)*64*ng
+        ind_loc = (i_here*ny*nz + j_here*nz + k_here)*64*ng
         shared_fill_ind = ind_loc + mode_ind_on_block
 
         # sync before loading up
