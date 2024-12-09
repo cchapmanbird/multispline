@@ -37,7 +37,7 @@ plot_grid = np.meshgrid(test_points_y, test_points_z, indexing='ij')
 # plt.show()
 
 coeffs_unshape = tspl.coefficients
-coeffs_reshape = coeffs_unshape.reshape(NX-1, NY-1, NZ-1, -1)
+coeffs_reshape = coeffs_unshape.reshape(NX-1, NY-1, NZ-1, 64)
 coeffs_reshape_in = np.array([coeffs_reshape for i in range(10)])
 
 sample_points_grid = np.meshgrid(sample_points_x, sample_points_y, sample_points_z, indexing='ij')
@@ -46,13 +46,13 @@ spline_handler = AmpInterp3dGPU(
     coeffs_reshape_in, 
     sample_points_x[0].item(),
     (sample_points_x[1] - sample_points_x[0]).item(),
-    sample_points_x.size,
+    sample_points_x.size - 1,
     sample_points_y[0].item(), 
     (sample_points_y[1] - sample_points_y[0]).item(),
-    sample_points_y.size,
+    sample_points_y.size - 1,
     sample_points_z[0].item(),
     (sample_points_z[1] - sample_points_z[0]).item(),
-    sample_points_z.size
+    sample_points_z.size - 1
 )
 
 print("IN")
@@ -64,6 +64,7 @@ gpu_res = spline_handler.evaluate_3d_spline(
     )
 
 print(tspl_values_f.shape, gpu_res[0].shape)
+
 
 plt.pcolormesh(*plot_grid, tspl_values_f[0,:,:], shading='gouraud', norm=LogNorm())
 plt.xlabel('y')
